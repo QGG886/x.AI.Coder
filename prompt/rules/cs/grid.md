@@ -10,6 +10,7 @@
 
 ## 表格属性转换
 
+
 **规则内容**：
 
 | WinForms 属性 | WPF 属性 |
@@ -58,11 +59,12 @@ int count = this.grdcSwapQuoteList.VisibleRowCount;
 
 ## 表格数据访问转换
 
+
 **规则内容**：
 
 | WinForms 方法 | WPF 方法 |
 |--------------|----------|
-| `grdv.GetRow(rowHandle)` | `grdc.GetRow(rowHandle)` 或 `grdc.CurrentItem` |
+| `grdv.GetRow(rowHandle)` | `grdc.CurrentItem` |
 | `grdv.GetFocusedRow()` | `grdc.CurrentItem` |
 | `grdv.FocusedRowHandle < 0` | `grdc.CurrentItem == null` |
 
@@ -74,7 +76,7 @@ XPOTCTrade focusedTrade = this.grdvSwapTradeList.GetFocusedRow() as XPOTCTrade;
 if (this.grdvSwapTradeList.FocusedRowHandle < 0) { }
 
 // WPF
-XPOTCTrade trade = this.grdcSwapTradList.GetRow(rowHandle) as XPOTCTrade;
+XPOTCTrade trade = this.grdcSwapTradList.CurrentItem as XPOTCTrade;
 XPOTCTrade focusedTrade = this.grdcSwapTradList.CurrentItem as XPOTCTrade;
 if (this.grdcSwapTradList.CurrentItem == null) { }
 ```

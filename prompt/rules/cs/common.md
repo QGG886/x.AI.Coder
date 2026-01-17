@@ -4,21 +4,20 @@
 
 本文件采用 Markdown 格式组织转换规则，每条规则包含以下部分：
 
-- **规则编号**：按类别顺序编号（如规则 1、规则 2 等）
 - **规则内容**：详细说明转换规则
 - **示例**：提供 WinForms 和 WPF 的代码对比示例
 - **注意事项**：特殊情况说明（如适用）
 
 **添加新规则时**：
 1. 在相应章节下添加新规则
-2. 规则编号按顺序递增
-3. 提供清晰的示例代码
-4. 使用代码块展示转换前后对比
-5. 如有特殊情况，添加注意事项说明
+2. 提供清晰的示例代码
+3. 使用代码块展示转换前后对比
+4. 如有特殊情况，添加注意事项说明
 
 ---
 
-## 规则 1：命名空间替换
+## 命名空间替换
+
 
 **规则内容**：
 
@@ -68,7 +67,8 @@ using xQuant.XUI.CFETSTrade;
 
 ---
 
-## 规则 2：Visibility 属性转换
+## Visibility 属性转换
+
 
 **规则内容**：
 
@@ -103,12 +103,14 @@ if (this.pageQuoteDeal.Visibility == Visibility.Visible)
 
 ---
 
-## 规则 3：Color 类型转换
+## Color 类型转换
+
 
 **规则内容**：
 
 - **直接使用 Color**：`Color.Yellow` → `Brushes.Yellow`
 - **方法返回的 Color**：需要调用 `.ToMediaBrush()` 转换为 `Brush`
+- **所有场景统一使用 Brushes**：属性赋值、条件判断、返回值等所有场景都使用 `Brushes.XXX`
 
 **示例**：
 ```csharp
@@ -117,12 +119,16 @@ e.Appearance.BackColor = Color.Yellow;
 e.Appearance.ForeColor = XirHelper.GetColorTrdType(trade.TRDTYPE);
 e.Appearance.BackColor = Color.BlueViolet;
 e.Appearance.ForeColor = Color.Red;
+if (color == Color.Red) { }
+return Color.Blue;
 
 // WPF
 e.Background = Brushes.Yellow;
 e.Foreground = XirHelper.GetColorTrdType(trade.TRDTYPE).ToMediaBrush();
 e.Background = Brushes.BlueViolet;
 e.Foreground = Brushes.Red;
+if (color == Brushes.Red) { }
+return Brushes.Blue;
 ```
 
 **注意事项**：

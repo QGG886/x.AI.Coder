@@ -53,18 +53,18 @@ prompt/rules/
 - Designer + XAML → `prompt/rules/designer/` 下的相应文件
 - CS + CS → `prompt/rules/cs/` 下的相应文件
 
-### 第三步：按优先级加载规则
+### 第三步：加载规则
 
-**后台代码优先级**：
-1. 优先级 1：`cs/common.md`
-2. 优先级 2：`cs/controls.md`（如果包含相关控件）
-3. 优先级 3：`cs/grid.md`（如果包含表格）
-4. 优先级 4：其他专项规则文件
+**后台代码加载顺序**：
+1. `cs/common.md`
+2. `cs/controls.md`（如果包含相关控件）
+3. `cs/grid.md`（如果包含表格）
+4. 其他专项规则文件
 
-**设计器代码优先级**：
-1. 优先级 1：`designer/layout.md`
-2. 优先级 2：`designer/controls.md`
-3. 优先级 3：`designer/events.md`
+**设计器代码加载顺序**：
+1. `designer/layout.md`
+2. `designer/controls.md`
+3. `designer/events.md`
 
 ---
 

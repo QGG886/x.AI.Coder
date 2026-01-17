@@ -1,485 +1,530 @@
 # WinForms → WPF Super Conversion Script
-# Runs transcode, review, and fix for each file group sequentially
+# 支持 WinForms 到 WPF 的转换、审查和修复
 
-# Set console encoding to UTF-8
+# ==================== 配置 ====================
+$CONFIG = @{
+    InputDir        = [System.IO.Path]::Combine($PSScriptRoot, "winform")
+    WpfDir          = [System.IO.Path]::Combine($PSScriptRoot, "wpf")
+    WpfFixDir       = [System.IO.Path]::Combine($PSScriptRoot, "wpf_fix")
+    TranscodeAgent  = [System.IO.Path]::Combine($PSScriptRoot, "prompt", "agents", "transcode", "transcode_single.agent.md")
+    ReviewAgent     = [System.IO.Path]::Combine($PSScriptRoot, "prompt", "agents", "review", "review_single.agent.md")
+    FixAgent        = [System.IO.Path]::Combine($PSScriptRoot, "prompt", "agents", "fix", "fix_single.agent.md")
+    TimeoutSec      = 21600  # 6小时超时
+    MaxConcurrency  = 1
+}
+
+# 设置编码
 $OutputEncoding = [System.Text.Encoding]::UTF8
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 [Console]::InputEncoding = [System.Text.Encoding]::UTF8
 $PSDefaultParameterValues['*:Encoding'] = 'utf8'
 
-# Configuration
-$INPUT_DIR       = Join-Path $PSScriptRoot "winform"
-$WPF_DIR         = Join-Path $PSScriptRoot "wpf"
-$SUPER_DIR       = Join-Path $PSScriptRoot "wpf_fix"
-$TRANSCODE_AGENT = Join-Path $PSScriptRoot "prompt/agents/transcode/transcode_single.agent.md"
-$REVIEW_AGENT    = Join-Path $PSScriptRoot "prompt/agents/review/review_single.agent.md"
-$FIX_AGENT       = Join-Path $PSScriptRoot "prompt/agents/fix/fix_single.agent.md"
-$TIMEOUT_SEC     = 21600  # 6 hours timeout
-$TEST_MODE       = $false  # Set to $true to skip actual iflow execution
+# ==================== 工具函数 ====================
 
-# Function to group WinForms files by prefix
-function Group-WinformFiles {
-    param (
-        [string]$InputDir
+# 错误分类定义
+$ErrorCategories = @{
+    FileNotFound = "ERROR_FILE_NOT_FOUND"
+    FileReadError = "ERROR_FILE_READ"
+    IflowTimeout = "ERROR_IFLOW_TIMEOUT"
+    IflowExecutionError = "ERROR_IFLOW_EXECUTION"
+    OutputWriteError = "ERROR_OUTPUT_WRITE"
+    InvalidParameter = "ERROR_INVALID_PARAMETER"
+    UnknownError = "ERROR_UNKNOWN"
+}
+
+# 错误日志函数
+function Write-ErrorLog {
+    param(
+        [string]$ErrorCode,
+        [string]$ErrorMessage,
+        [string]$StackTrace = "",
+        [string]$FilePath = ""
     )
+    
+    $logDir = [System.IO.Path]::Combine($PSScriptRoot, "logs")
+    New-Item -Path $logDir -ItemType Directory -Force | Out-Null
+    
+    $logFile = [System.IO.Path]::Combine($logDir, "errors_$(Get-Date -Format 'yyyyMMdd').log")
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    
+    $logEntry = "[$timestamp] [$ErrorCode] $ErrorMessage"
+    if ($StackTrace) {
+        $logEntry += "`nStackTrace: $StackTrace"
+    }
+    if ($FilePath) {
+        $logEntry += "`nFilePath: $FilePath"
+    }
+    $logEntry += "`n" + ("-" * 80) + "`n"
+    
+    Add-Content -Path $logFile -Value $logEntry -Encoding UTF8
+}
+
+# 清理非.cs/.xaml/.md文件
+function Remove-NonTargetFiles {
+    param([string]$Directory)
+
+    if (-not (Test-Path $Directory)) { return }
+
+    $deleted = 0
+    $kept = 0
+
+    Get-ChildItem -Path $Directory -Recurse -File | ForEach-Object {
+        $ext = $_.Extension.ToLower()
+        if ($ext -in @('.cs', '.xaml', '.md')) {
+            $kept++
+        } else {
+            Remove-Item $_.FullName -Force
+            $deleted++
+        }
+    }
+
+    Write-Host "清理完成: 删除 $deleted 个文件，保留 $kept 个文件" -ForegroundColor Green
+}
+
+# 分组WinForms文件
+function Get-WinformFileGroups {
+    param([string]$InputDir)
 
     $groups = @{}
+    $allFiles = Get-ChildItem -Path $InputDir -Filter "*.cs" -File -Recurse
 
-    $allCsFiles = Get-ChildItem -Path $InputDir -Filter "*.cs" -File -Recurse
+    foreach ($file in $allFiles) {
+        $isDesigner = $file.Name -imatch '\.designer\.cs$'
+        $prefix = if ($isDesigner) { $file.Name -ireplace '\.designer\.cs$', '' } else { $file.BaseName }
 
-    $csFiles       = @()
-    $designerFiles = @()
-
-    foreach ($file in $allCsFiles) {
-        if ($file.Name -imatch '\.designer\.cs$') {
-            $designerFiles += $file
+        $relativePath = if ($file.Directory.FullName -eq $InputDir) {
+            ""
         } else {
-            $csFiles += $file
-        }
-    }
-
-    foreach ($file in $designerFiles) {
-        $prefix = $file.Name -ireplace '\.designer\.cs$', ''
-
-        if ($file.Directory.FullName -eq $InputDir) {
-            $relativePath = ""
-        } else {
-            $relativePath = $file.Directory.FullName.Substring($InputDir.Length + 1)
+            $file.Directory.FullName.Substring($InputDir.Length + 1)
         }
 
-        if (-not $groups.ContainsKey("$relativePath\$prefix")) {
-            $groups["$relativePath\$prefix"] = @{
-                RelativePath = $relativePath
-                Prefix = $prefix
-                WinformDesigner = $file.FullName
-                WinformCs = $null
+        $groupKey = if ($relativePath) { [System.IO.Path]::Combine($relativePath, $prefix) } else { $prefix }
+
+        if (-not $groups.ContainsKey($groupKey)) {
+            $groups[$groupKey] = @{
+                RelativePath     = $relativePath
+                Prefix           = $prefix
+                WinformDesigner  = $null
+                WinformCs        = $null
             }
         }
-        $groups["$relativePath\$prefix"].WinformDesigner = $file.FullName
-    }
 
-    foreach ($file in $csFiles) {
-        $prefix = $file.BaseName
-
-        if ($file.Directory.FullName -eq $InputDir) {
-            $relativePath = ""
+        if ($isDesigner) {
+            $groups[$groupKey].WinformDesigner = $file.FullName
         } else {
-            $relativePath = $file.Directory.FullName.Substring($InputDir.Length + 1)
+            $groups[$groupKey].WinformCs = $file.FullName
         }
-
-        if (-not $groups.ContainsKey("$relativePath\$prefix")) {
-            $groups["$relativePath\$prefix"] = @{
-                RelativePath = $relativePath
-                Prefix = $prefix
-                WinformDesigner = $null
-                WinformCs = $null
-            }
-        }
-        $groups["$relativePath\$prefix"].WinformCs = $file.FullName
     }
 
     return $groups
 }
 
-# Function to run transcode for a single file group
-function Run-TranscodeForGroup {
-    param (
-        [hashtable]$FileGroup,
-        [int]$CurrentIndex,
-        [int]$TotalCount
-    )
+# ==================== 主程序 ====================
 
-    $relativePath = $FileGroup.RelativePath
-    $prefix = $FileGroup.Prefix
-    $groupKey = "$relativePath\$prefix"
+# 打印标题
+Write-Host ("=" * 60)
+Write-Host "x.AI.Coder 代码助手"
+Write-Host ("=" * 60)
 
-    $groupOutputDir = Join-Path $WPF_DIR $relativePath
-    $logFile = "$prefix.trans.log.md"
+# 验证输入目录
+if (-not (Test-Path $CONFIG.InputDir)) {
+    Write-Host "错误: 输入目录不存在: $($CONFIG.InputDir)" -ForegroundColor Red
+    exit 1
+}
 
-    try {
-        # Create output directory if it doesn't exist
-        if (-not (Test-Path $groupOutputDir)) {
-            New-Item -Path $groupOutputDir -ItemType Directory -Force | Out-Null
+# 选择执行模式
+Write-Host "`n请选择执行模式:"
+Write-Host "  1 - 仅转换"
+Write-Host "  2 - 仅审查"
+Write-Host "  3 - 全部执行 (转换 -> 审查 -> 修复)"
+$modeInput = Read-Host "请输入选项 (1/2/3)"
+
+$mode = switch ($modeInput.Trim()) {
+    "1" { 1 }
+    "2" { 2 }
+    "3" { 3 }
+    default { 3 }
+}
+
+$modeNames = @{ 1 = "仅转换"; 2 = "仅审查"; 3 = "全部执行" }
+Write-Host "`n已选择: $($modeNames[$mode])" -ForegroundColor Green
+
+# 创建输出目录
+New-Item -Path $CONFIG.WpfDir -ItemType Directory -Force | Out-Null
+New-Item -Path $CONFIG.WpfFixDir -ItemType Directory -Force | Out-Null
+
+# 清理输入目录
+Write-Host "`n正在清理输入目录..."
+Remove-NonTargetFiles -Directory $CONFIG.InputDir
+
+# 分析WinForms文件
+Write-Host "`n正在分析 WinForms 文件..."
+$winformGroups = Get-WinformFileGroups -InputDir $CONFIG.InputDir
+
+if ($winformGroups.Count -eq 0) {
+    Write-Host "警告: 没有找到需要处理的 WinForms 文件" -ForegroundColor Yellow
+    exit 0
+}
+
+Write-Host "找到 $($winformGroups.Count) 个文件组需要处理"
+Write-Host "最大并发数: $($CONFIG.MaxConcurrency)`n"
+
+# 并行处理文件组
+$results = [HashTable]::Synchronized(@{})
+$counter = 0
+$groupList = $winformGroups.GetEnumerator() | Sort-Object Key
+
+$parallelResults = $groupList | ForEach-Object -ThrottleLimit $CONFIG.MaxConcurrency -Parallel {
+    $entry = $_
+    $group = $entry.Value
+    $key = $entry.Key
+
+    $currentIndex = [System.Threading.Interlocked]::Increment([ref]$using:counter)
+    $totalCount = $using:winformGroups.Count
+    $mode = $using:mode
+    $CONFIG = $using:CONFIG
+
+    # ==================== 并行块内的函数定义 ====================
+
+    # 执行iflow命令
+    function Invoke-Iflow {
+        param(
+            [string]$Prompt,
+            [string]$StepName = "Unknown",
+            [string]$FilePath = ""
+        )
+
+        $startTime = Get-Date
+        $env:PYTHONIOENCODING = "utf-8"
+
+        try {
+            $job = Start-Job -ScriptBlock {
+                param($p, $dir)
+                Push-Location $dir
+                try { & iflow --thinking -p $p 2>&1 } finally { Pop-Location }
+            } -ArgumentList $Prompt, $using:PSScriptRoot
+
+            $completed = $job | Wait-Job -Timeout $CONFIG.TimeoutSec
+
+            if ($completed) {
+                $output = Receive-Job -Job $job
+                $success = ($job.State -eq 'Completed')
+
+                # 检查是否有错误
+                if (-not $success) {
+                    $errorMessage = "Iflow job failed with state: $($job.State)"
+                    if ($job.Error) {
+                        $errorMessage += "`nError: $($job.Error | Out-String)"
+                    }
+                    Write-ErrorLog -ErrorCode $ErrorCategories.IflowExecutionError -ErrorMessage $errorMessage -StackTrace ($job.Error | Out-String) -FilePath $FilePath
+                }
+            } else {
+                $output = @("Timeout after $($CONFIG.TimeoutSec) seconds")
+                $success = $false
+                $errorMessage = "Iflow job timed out after $($CONFIG.TimeoutSec) seconds"
+                Write-ErrorLog -ErrorCode $ErrorCategories.IflowTimeout -ErrorMessage $errorMessage -FilePath $FilePath
+                Stop-Job -Job $job
+            }
+
+            Remove-Job -Job $job -Force
+
+            $elapsedTime = "{0:N2}" -f ((Get-Date) - $startTime).TotalMinutes
+
+            return @{
+                Success     = $success
+                Message     = $output -join "`n"
+                ElapsedTime = $elapsedTime
+                ErrorCode   = if (-not $success) { $ErrorCategories.IflowExecutionError } else { "" }
+            }
+        } catch {
+            $errorMessage = "Exception in Invoke-Iflow: $($_.Exception.Message)"
+            Write-ErrorLog -ErrorCode $ErrorCategories.UnknownError -ErrorMessage $errorMessage -StackTrace $_.ScriptStackTrace -FilePath $FilePath
+            return @{
+                Success     = $false
+                Message     = $errorMessage
+                ElapsedTime = "{0:N2}" -f ((Get-Date) - $startTime).TotalMinutes
+                ErrorCode   = $ErrorCategories.UnknownError
+            }
         }
+    }
 
-        # Prepare file list
+    # 执行转换步骤
+    function Invoke-Transcode {
+        param(
+            [hashtable]$FileGroup,
+            [string]$GroupKeyDisplay,
+            [int]$Index,
+            [int]$Total
+        )
+
+        $relativePath = $FileGroup.RelativePath
+        $prefix = $FileGroup.Prefix
+        $outputDir = if ($relativePath) { [System.IO.Path]::Combine($CONFIG.WpfDir, $relativePath) } else { $CONFIG.WpfDir }
+
+        New-Item -Path $outputDir -ItemType Directory -Force | Out-Null
+
         $filesList = @()
         if ($FileGroup.WinformDesigner) { $filesList += $FileGroup.WinformDesigner }
         if ($FileGroup.WinformCs) { $filesList += $FileGroup.WinformCs }
 
         if ($filesList.Count -eq 0) {
-            Write-Host "[$CurrentIndex/$TotalCount] [$groupKey] No files to transcode" -ForegroundColor Yellow
-            return @{ Success = $true; Message = "No files to transcode" }
+            Write-Host "[$Index/$Total] [$GroupKeyDisplay] 没有文件需要转换" -ForegroundColor Yellow
+            return @{ Success = $true }
         }
 
-        # Prepare prompt
-        $prompt = Get-Content -Path $TRANSCODE_AGENT -Encoding UTF8 -Raw
-        $filesString = $filesList -join ","
-        $prompt = $prompt -replace [regex]::Escape("{FILES}"),     $filesString
-        $prompt = $prompt -replace [regex]::Escape("{OUTPUT_DIR}"), $groupOutputDir
-        $prompt = $prompt -replace [regex]::Escape("{LOG_FILE}"),   $logFile
+        $prompt = Get-Content -Path $CONFIG.TranscodeAgent -Encoding UTF8 -Raw
+        $prompt = $prompt -replace '\{FILES\}', ($filesList -join ',')
+        $prompt = $prompt -replace '\{OUTPUT_DIR\}', $outputDir
+        $prompt = $prompt -replace '\{LOG_FILE\}', "$prefix.trans.log.md"
 
-        Write-Host "`n[$CurrentIndex/$TotalCount] [$groupKey] Step 1/3: Transcoding..."
-        Write-Host "[$CurrentIndex/$TotalCount] [$groupKey] Files: $(($filesList | ForEach-Object { (Get-Item $_).Name }) -join ', ')"
+        Write-Host "[$Index/$Total] [$GroupKeyDisplay] 步骤 1/3: 正在转换..."
+        $result = Invoke-Iflow -Prompt $prompt
 
-        if ($TEST_MODE) {
-            Write-Host "[$CurrentIndex/$TotalCount] [$groupKey] TEST MODE: Skipping transcode"
-            return @{ Success = $true; Message = "Test mode - transcode skipped" }
-        }
+        if ($result.Success) {
+            Write-Host "[$Index/$Total] [$GroupKeyDisplay] 转换完成 (耗时: $($result.ElapsedTime) 分钟)" -ForegroundColor Green
 
-        # Run transcode
-        $env:PYTHONIOENCODING = "utf-8"
-        $job = Start-Job -ScriptBlock {
-            param($prompt, $projectDir)
-            Push-Location $projectDir
-            try {
-                & iflow --thinking -p $prompt 2>&1
-            } finally {
-                Pop-Location
-            }
-        } -ArgumentList $prompt, $PSScriptRoot
+            # 更新文件组中的WPF文件路径
+            $wpfXaml = [System.IO.Path]::Combine($outputDir, "$prefix.xaml")
+            $wpfCs = [System.IO.Path]::Combine($outputDir, "$prefix.xaml.cs")
+            $transLog = [System.IO.Path]::Combine($outputDir, "$prefix.trans.log.md")
 
-        $completed = $job | Wait-Job -Timeout $TIMEOUT_SEC
+            if (Test-Path $wpfXaml) { $FileGroup.WpfXaml = $wpfXaml }
+            if (Test-Path $wpfCs) { $FileGroup.WpfCs = $wpfCs }
+            if (Test-Path $transLog) { $FileGroup.TransLog = $transLog }
 
-        if ($completed) {
-            $output = Receive-Job -Job $job
-            $success = ($job.State -eq 'Completed')
+            return @{ Success = $true; FileGroup = $FileGroup }
         } else {
-            $output = @("Timeout after $TIMEOUT_SEC seconds")
-            $success = $false
-            Stop-Job -Job $job
+            Write-Host "[$Index/$Total] [$GroupKeyDisplay] 转换失败 (耗时: $($result.ElapsedTime) 分钟)" -ForegroundColor Red
+            return @{ Success = $false; Error = "转换失败: $($result.Message)" }
         }
-
-        Remove-Job -Job $job -Force
-
-        if ($success) {
-            Write-Host "[$CurrentIndex/$TotalCount] [$groupKey] Transcode completed" -ForegroundColor Green
-        } else {
-            Write-Host "[$CurrentIndex/$TotalCount] [$groupKey] Transcode failed" -ForegroundColor Red
-        }
-
-        return @{ Success = $success; Message = ($output -join "`n") }
-
-    } catch {
-        $errMsg = $_.Exception.Message
-        Write-Host "[$CurrentIndex/$TotalCount] [$groupKey] Transcode exception: $errMsg" -ForegroundColor Red
-        return @{ Success = $false; Message = $errMsg }
     }
-}
 
-# Function to run review for a single file group
-function Run-ReviewForGroup {
-    param (
-        [hashtable]$FileGroup,
-        [int]$CurrentIndex,
-        [int]$TotalCount
-    )
+    # 执行审查步骤
+    function Invoke-Review {
+        param(
+            [hashtable]$FileGroup,
+            [string]$GroupKeyDisplay,
+            [int]$Index,
+            [int]$Total
+        )
 
-    $relativePath = $FileGroup.RelativePath
-    $prefix = $FileGroup.Prefix
-    $groupKey = "$relativePath\$prefix"
+        $relativePath = $FileGroup.RelativePath
+        $prefix = $FileGroup.Prefix
+        $outputDir = if ($relativePath) { [System.IO.Path]::Combine($CONFIG.WpfDir, $relativePath) } else { $CONFIG.WpfDir }
 
-    $groupOutputDir = Join-Path $WPF_DIR $relativePath
-    $reportFile = "$prefix.review.log.md"
+        # 检查必需的文件：WinformCs 和 WpfCs 是必须的
+        # WinformDesigner 和 WpfXaml 都是可选的（纯代码文件转换）
+        $requiredFiles = @()
+        if ($FileGroup.WinformCs) { $requiredFiles += $FileGroup.WinformCs }
+        if ($FileGroup.WpfCs) { $requiredFiles += $FileGroup.WpfCs }
 
-    try {
-        # Prepare file list
-        $filesList = @()
-        if ($FileGroup.WinformDesigner) { $filesList += $FileGroup.WinformDesigner }
-        if ($FileGroup.WpfXaml) { $filesList += $FileGroup.WpfXaml }
-        if ($FileGroup.WinformCs) { $filesList += $FileGroup.WinformCs }
-        if ($FileGroup.WpfCs) { $filesList += $FileGroup.WpfCs }
-
-        if ($filesList.Count -lt 4) {
-            Write-Host "[$CurrentIndex/$TotalCount] [$groupKey] Missing files for review" -ForegroundColor Yellow
-            return @{ Success = $false; Message = "Missing files for review" }
+        if ($requiredFiles.Count -lt 2) {
+            Write-Host "[$Index/$Total] [$GroupKeyDisplay] 缺少审查所需的文件" -ForegroundColor Yellow
+            return @{ Success = $true }
         }
 
-        # Prepare prompt
-        $prompt = Get-Content -Path $REVIEW_AGENT -Encoding UTF8 -Raw
-        $filesString = $filesList -join ","
-        $prompt = $prompt -replace [regex]::Escape("{FILES}"),      $filesString
-        $prompt = $prompt -replace [regex]::Escape("{OUTPUT_DIR}"), $groupOutputDir
-        $prompt = $prompt -replace [regex]::Escape("{REPORT_FILE}"), $reportFile
+        $filesList = @(
+            $FileGroup.WinformDesigner,
+            $FileGroup.WpfXaml,
+            $FileGroup.WinformCs,
+            $FileGroup.WpfCs
+        ) | Where-Object { $_ -ne $null }
 
-        Write-Host "[$CurrentIndex/$TotalCount] [$groupKey] Step 2/3: Reviewing..."
+        $prompt = Get-Content -Path $CONFIG.ReviewAgent -Encoding UTF8 -Raw
+        $prompt = $prompt -replace '\{FILES\}', ($filesList -join ',')
+        $prompt = $prompt -replace '\{OUTPUT_DIR\}', $outputDir
+        $prompt = $prompt -replace '\{REPORT_FILE\}', "$prefix.review.log.md"
 
-        if ($TEST_MODE) {
-            Write-Host "[$CurrentIndex/$TotalCount] [$groupKey] TEST MODE: Skipping review"
-            return @{ Success = $true; Message = "Test mode - review skipped" }
-        }
+        Write-Host "[$Index/$Total] [$GroupKeyDisplay] 步骤 2/3: 正在审查..."
+        $result = Invoke-Iflow -Prompt $prompt
 
-        # Run review
-        $env:PYTHONIOENCODING = "utf-8"
-        $job = Start-Job -ScriptBlock {
-            param($prompt, $projectDir)
-            Push-Location $projectDir
-            try {
-                & iflow --thinking -p $prompt 2>&1
-            } finally {
-                Pop-Location
-            }
-        } -ArgumentList $prompt, $PSScriptRoot
-
-        $completed = $job | Wait-Job -Timeout $TIMEOUT_SEC
-
-        if ($completed) {
-            $output = Receive-Job -Job $job
-            $success = ($job.State -eq 'Completed')
+        if ($result.Success) {
+            Write-Host "[$Index/$Total] [$GroupKeyDisplay] 审查完成 (耗时: $($result.ElapsedTime) 分钟)" -ForegroundColor Green
+            $reviewLog = [System.IO.Path]::Combine($outputDir, "$prefix.review.log.md")
+            if (Test-Path $reviewLog) { $FileGroup.ReviewLog = $reviewLog }
+            return @{ Success = $true; FileGroup = $FileGroup }
         } else {
-            $output = @("Timeout after $TIMEOUT_SEC seconds")
-            $success = $false
-            Stop-Job -Job $job
+            Write-Host "[$Index/$Total] [$GroupKeyDisplay] 审查失败 (耗时: $($result.ElapsedTime) 分钟)" -ForegroundColor Red
+            return @{ Success = $false; Error = "审查失败: $($result.Message)" }
         }
-
-        Remove-Job -Job $job -Force
-
-        if ($success) {
-            Write-Host "[$CurrentIndex/$TotalCount] [$groupKey] Review completed" -ForegroundColor Green
-        } else {
-            Write-Host "[$CurrentIndex/$TotalCount] [$groupKey] Review failed" -ForegroundColor Red
-        }
-
-        return @{ Success = $success; Message = ($output -join "`n") }
-
-    } catch {
-        $errMsg = $_.Exception.Message
-        Write-Host "[$CurrentIndex/$TotalCount] [$groupKey] Review exception: $errMsg" -ForegroundColor Red
-        return @{ Success = $false; Message = $errMsg }
     }
-}
 
-# Function to run fix for a single file group
-function Run-FixForGroup {
-    param (
-        [hashtable]$FileGroup,
-        [int]$CurrentIndex,
-        [int]$TotalCount
-    )
+    # 执行修复步骤
+    function Invoke-Fix {
+        param(
+            [hashtable]$FileGroup,
+            [string]$GroupKeyDisplay,
+            [int]$Index,
+            [int]$Total
+        )
 
-    $relativePath = $FileGroup.RelativePath
-    $prefix = $FileGroup.Prefix
-    $groupKey = "$relativePath\$prefix"
+        $relativePath = $FileGroup.RelativePath
+        $prefix = $FileGroup.Prefix
+        $outputDir = if ($relativePath) { [System.IO.Path]::Combine($CONFIG.WpfFixDir, $relativePath) } else { $CONFIG.WpfFixDir }
 
-    $groupOutputDir = Join-Path $SUPER_DIR $relativePath
-    $logFile = "$prefix.super.log.md"
+        New-Item -Path $outputDir -ItemType Directory -Force | Out-Null
 
-    try {
-        # Create output directory if it doesn't exist
-        if (-not (Test-Path $groupOutputDir)) {
-            New-Item -Path $groupOutputDir -ItemType Directory -Force | Out-Null
+        # 检查必需的文件：WinformCs、WpfCs、TransLog、ReviewLog 是必须的
+        # WinformDesigner 和 WpfXaml 都是可选的（纯代码文件转换）
+        $requiredFiles = @()
+        if ($FileGroup.WinformCs) { $requiredFiles += $FileGroup.WinformCs }
+        if ($FileGroup.WpfCs) { $requiredFiles += $FileGroup.WpfCs }
+        if ($FileGroup.TransLog) { $requiredFiles += $FileGroup.TransLog }
+        if ($FileGroup.ReviewLog) { $requiredFiles += $FileGroup.ReviewLog }
+
+        if ($requiredFiles.Count -lt 4) {
+            Write-Host "[$Index/$Total] [$GroupKeyDisplay] 缺少修复所需的文件" -ForegroundColor Yellow
+            return @{ Success = $true }
         }
 
-        # Prepare file list
-        $filesList = @()
-        if ($FileGroup.WinformDesigner) { $filesList += $FileGroup.WinformDesigner }
-        if ($FileGroup.WpfXaml) { $filesList += $FileGroup.WpfXaml }
-        if ($FileGroup.WinformCs) { $filesList += $FileGroup.WinformCs }
-        if ($FileGroup.WpfCs) { $filesList += $FileGroup.WpfCs }
-        if ($FileGroup.TransLog) { $filesList += $FileGroup.TransLog }
-        if ($FileGroup.ReviewLog) { $filesList += $FileGroup.ReviewLog }
+        $filesList = @(
+            $FileGroup.WinformDesigner,
+            $FileGroup.WpfXaml,
+            $FileGroup.WinformCs,
+            $FileGroup.WpfCs,
+            $FileGroup.TransLog,
+            $FileGroup.ReviewLog
+        ) | Where-Object { $_ -ne $null }
 
-        if ($filesList.Count -lt 6) {
-            Write-Host "[$CurrentIndex/$TotalCount] [$groupKey] Missing files for fix" -ForegroundColor Yellow
-            return @{ Success = $false; Message = "Missing files for fix" }
-        }
+        $prompt = Get-Content -Path $CONFIG.FixAgent -Encoding UTF8 -Raw
+        $prompt = $prompt -replace '\{FILES\}', ($filesList -join ',')
+        $prompt = $prompt -replace '\{OUTPUT_DIR\}', $outputDir
+        $prompt = $prompt -replace '\{LOG_FILE\}', "$prefix.super.log.md"
 
-        # Prepare prompt
-        $prompt = Get-Content -Path $FIX_AGENT -Encoding UTF8 -Raw
-        $filesString = $filesList -join ","
-        $prompt = $prompt -replace [regex]::Escape("{FILES}"),     $filesString
-        $prompt = $prompt -replace [regex]::Escape("{OUTPUT_DIR}"), $groupOutputDir
-        $prompt = $prompt -replace [regex]::Escape("{LOG_FILE}"),   $logFile
+        Write-Host "[$Index/$Total] [$GroupKeyDisplay] 步骤 3/3: 正在修复..."
+        $result = Invoke-Iflow -Prompt $prompt
 
-        Write-Host "[$CurrentIndex/$TotalCount] [$groupKey] Step 3/3: Fixing..."
-
-        if ($TEST_MODE) {
-            Write-Host "[$CurrentIndex/$TotalCount] [$groupKey] TEST MODE: Skipping fix"
-            return @{ Success = $true; Message = "Test mode - fix skipped" }
-        }
-
-        # Run fix
-        $env:PYTHONIOENCODING = "utf-8"
-        $job = Start-Job -ScriptBlock {
-            param($prompt, $projectDir)
-            Push-Location $projectDir
-            try {
-                & iflow --thinking -p $prompt 2>&1
-            } finally {
-                Pop-Location
-            }
-        } -ArgumentList $prompt, $PSScriptRoot
-
-        $completed = $job | Wait-Job -Timeout $TIMEOUT_SEC
-
-        if ($completed) {
-            $output = Receive-Job -Job $job
-            $success = ($job.State -eq 'Completed')
+        if ($result.Success) {
+            Write-Host "[$Index/$Total] [$GroupKeyDisplay] 修复完成 (耗时: $($result.ElapsedTime) 分钟)" -ForegroundColor Green
+            return @{ Success = $true }
         } else {
-            $output = @("Timeout after $TIMEOUT_SEC seconds")
-            $success = $false
-            Stop-Job -Job $job
+            Write-Host "[$Index/$Total] [$GroupKeyDisplay] 修复失败 (耗时: $($result.ElapsedTime) 分钟)" -ForegroundColor Red
+            return @{ Success = $false; Error = "修复失败: $($result.Message)" }
         }
-
-        Remove-Job -Job $job -Force
-
-        if ($success) {
-            Write-Host "[$CurrentIndex/$TotalCount] [$groupKey] Fix completed" -ForegroundColor Green
-        } else {
-            Write-Host "[$CurrentIndex/$TotalCount] [$groupKey] Fix failed" -ForegroundColor Red
-        }
-
-        return @{ Success = $success; Message = ($output -join "`n") }
-
-    } catch {
-        $errMsg = $_.Exception.Message
-        Write-Host "[$CurrentIndex/$TotalCount] [$groupKey] Fix exception: $errMsg" -ForegroundColor Red
-        return @{ Success = $false; Message = $errMsg }
     }
-}
 
-# Main logic
-Write-Host ("=" * 60)
-Write-Host "WinForms to WPF Super Conversion Script"
-Write-Host "Execution mode: Per-file-group (transcode -> review -> fix)"
-Write-Host ("=" * 60)
+    # ==================== 处理逻辑 ====================
 
-if ($TEST_MODE) {
-    Write-Host "TEST MODE: Running in test mode, skipping actual conversion"
-}
+    $fileGroup = @{
+        RelativePath     = $group.RelativePath
+        Prefix           = $group.Prefix
+        WinformDesigner  = $group.WinformDesigner
+        WinformCs        = $group.WinformCs
+        WpfXaml          = $null
+        WpfCs            = $null
+        TransLog         = $null
+        ReviewLog        = $null
+    }
 
-# Validate input directory
-if (-not (Test-Path $INPUT_DIR)) {
-    Write-Host "Error: Input directory $INPUT_DIR does not exist" -ForegroundColor Red
-    exit 1
-}
-
-# Create output directories
-New-Item -Path $WPF_DIR -ItemType Directory -Force | Out-Null
-New-Item -Path $SUPER_DIR -ItemType Directory -Force | Out-Null
-
-# Group WinForms files
-Write-Host "`nAnalyzing WinForms files..."
-$winformGroups = Group-WinformFiles -InputDir $INPUT_DIR
-
-if ($winformGroups.Count -eq 0) {
-    Write-Host "Warning: No WinForms files found to process" -ForegroundColor Yellow
-    exit 0
-}
-
-Write-Host "Found $($winformGroups.Count) file groups to process"
-Write-Host ""
-
-# Process each file group
-$results = @()
-$currentIndex = 0
-
-foreach ($groupKey in $winformGroups.Keys | Sort-Object) {
-    $fileGroup = $winformGroups[$groupKey]
-    $currentIndex++
+    $relativePath = $group.RelativePath
+    $prefix = $group.Prefix
+    $groupKeyDisplay = if ($relativePath) { [System.IO.Path]::Combine($relativePath, $prefix) } else { $prefix }
 
     Write-Host ("-" * 60)
-    Write-Host "Processing file group [$currentIndex/$($winformGroups.Count)]: $groupKey"
+    Write-Host "处理文件组 [$currentIndex/$totalCount]: $groupKeyDisplay"
     Write-Host ("-" * 60)
 
-    # Step 1: Transcode
-    $transcodeResult = Run-TranscodeForGroup -FileGroup $fileGroup -CurrentIndex $currentIndex -TotalCount $winformGroups.Count
-
-    if (-not $transcodeResult.Success) {
-        Write-Host "[$currentIndex/$($winformGroups.Count)] [$groupKey] Transcode failed, skipping review and fix" -ForegroundColor Red
-        $results += @{
-            GroupKey = $groupKey
-            TranscodeSuccess = $false
-            ReviewSuccess = $false
-            FixSuccess = $false
-            Error = "Transcode failed: $($transcodeResult.Message)"
-        }
-        continue
+    $result = @{
+        GroupKey          = $key
+        TranscodeSuccess  = $false
+        ReviewSuccess     = $false
+        FixSuccess        = $false
+        Error             = $null
     }
 
-    # Update file group with WPF files
-    $relativePath = $fileGroup.RelativePath
-    $prefix = $fileGroup.Prefix
-    $wpfXaml = Join-Path $WPF_DIR "$relativePath\$prefix.xaml"
-    $wpfCs = Join-Path $WPF_DIR "$relativePath\$prefix.xaml.cs"
-    $transLog = Join-Path $WPF_DIR "$relativePath\$prefix.trans.log.md"
-
-    if (Test-Path $wpfXaml) { $fileGroup.WpfXaml = $wpfXaml }
-    if (Test-Path $wpfCs) { $fileGroup.WpfCs = $wpfCs }
-    if (Test-Path $transLog) { $fileGroup.TransLog = $transLog }
-
-    # Step 2: Review
-    $reviewResult = Run-ReviewForGroup -FileGroup $fileGroup -CurrentIndex $currentIndex -TotalCount $winformGroups.Count
-
-    if (-not $reviewResult.Success) {
-        Write-Host "[$currentIndex/$($winformGroups.Count)] [$groupKey] Review failed, skipping fix" -ForegroundColor Red
-        $results += @{
-            GroupKey = $groupKey
-            TranscodeSuccess = $true
-            ReviewSuccess = $false
-            FixSuccess = $false
-            Error = "Review failed: $($reviewResult.Message)"
+    # 步骤1: 转换
+    if ($mode -eq 1 -or $mode -eq 3) {
+        $transResult = Invoke-Transcode -FileGroup $fileGroup -GroupKeyDisplay $groupKeyDisplay -Index $currentIndex -Total $totalCount
+        if ($transResult.Success) {
+            $result.TranscodeSuccess = $true
+            if ($transResult.FileGroup) { $fileGroup = $transResult.FileGroup }
+        } else {
+            $result.Error = $transResult.Error
+            return $result
         }
-        continue
+    } elseif ($mode -eq 2) {
+        $result.TranscodeSuccess = $true
     }
 
-    # Update file group with review log
-    $reviewLog = Join-Path $WPF_DIR "$relativePath\$prefix.review.log.md"
-    if (Test-Path $reviewLog) { $fileGroup.ReviewLog = $reviewLog }
+    # 步骤2: 审查
+    if ($mode -eq 2 -or $mode -eq 3) {
+        $reviewResult = Invoke-Review -FileGroup $fileGroup -GroupKeyDisplay $groupKeyDisplay -Index $currentIndex -Total $totalCount
+        if ($reviewResult.Success) {
+            $result.ReviewSuccess = $true
+            if ($reviewResult.FileGroup) { $fileGroup = $reviewResult.FileGroup }
+        } else {
+            $result.Error = $reviewResult.Error
+            return $result
+        }
+    } elseif ($mode -eq 1) {
+        $result.ReviewSuccess = $true
+    }
 
-    # Step 3: Fix
-    $fixResult = Run-FixForGroup -FileGroup $fileGroup -CurrentIndex $currentIndex -TotalCount $winformGroups.Count
-
-    if ($fixResult.Success) {
-        Write-Host "[$currentIndex/$($winformGroups.Count)] [$groupKey] All steps completed successfully" -ForegroundColor Green
+    # 步骤3: 修复
+    if ($mode -eq 3) {
+        $fixResult = Invoke-Fix -FileGroup $fileGroup -GroupKeyDisplay $groupKeyDisplay -Index $currentIndex -Total $totalCount
+        if ($fixResult.Success) {
+            $result.FixSuccess = $true
+        } else {
+            $result.Error = $fixResult.Error
+        }
     } else {
-        Write-Host "[$currentIndex/$($winformGroups.Count)] [$groupKey] Fix failed" -ForegroundColor Red
+        $result.FixSuccess = $true
     }
 
-    $results += @{
-        GroupKey = $groupKey
-        TranscodeSuccess = $transcodeResult.Success
-        ReviewSuccess = $reviewResult.Success
-        FixSuccess = $fixResult.Success
-        Error = if (-not $fixResult.Success) { $fixResult.Message } else { $null }
+    return $result
+}
+
+# 收集结果
+foreach ($item in $parallelResults) {
+    $results[$item.GroupKey] = $item
+}
+
+# 输出摘要
+Write-Host "`n" + ("=" * 60)
+Write-Host "转换摘要"
+Write-Host ("=" * 60)
+
+$fullSuccess = 0
+$partialSuccess = 0
+$failed = 0
+
+foreach ($result in $results.Values) {
+    if ($result.TranscodeSuccess -and $result.ReviewSuccess -and $result.FixSuccess) {
+        $fullSuccess++
+    } elseif ($result.TranscodeSuccess) {
+        $partialSuccess++
+    } else {
+        $failed++
     }
 }
 
-# Summary
-Write-Host "`n" + ("=" * 60)
-Write-Host "Super Conversion Summary"
-Write-Host ("=" * 60)
-
-$fullSuccess = ($results | Where-Object { $_.TranscodeSuccess -and $_.ReviewSuccess -and $_.FixSuccess }).Count
-$partialSuccess = ($results | Where-Object { -not ($_.TranscodeSuccess -and $_.ReviewSuccess -and $_.FixSuccess) -and $_.TranscodeSuccess }).Count
-$failed = ($results | Where-Object { -not $_.TranscodeSuccess }).Count
-
-Write-Host "Total file groups: $($results.Count)"
-Write-Host "Fully successful: $fullSuccess"
-Write-Host "Partially successful: $partialSuccess"
-Write-Host "Failed: $failed"
+Write-Host "文件组总数: $($results.Count)"
+Write-Host "完全成功: $fullSuccess"
+Write-Host "部分成功: $partialSuccess"
+Write-Host "失败: $failed"
 
 if ($failed -gt 0) {
-    Write-Host "`nFailed file groups:"
-    $results | Where-Object { -not $_.TranscodeSuccess } | ForEach-Object {
+    Write-Host "`n失败的文件组:"
+    $results.Values | Where-Object { -not $_.TranscodeSuccess } | ForEach-Object {
         Write-Host "  - $($_.GroupKey): $($_.Error)" -ForegroundColor Red
     }
 }
 
 if ($partialSuccess -gt 0) {
-    Write-Host "`nPartially successful file groups:"
-    $results | Where-Object { -not ($_.TranscodeSuccess -and $_.ReviewSuccess -and $_.FixSuccess) -and $_.TranscodeSuccess } | ForEach-Object {
+    Write-Host "`n部分成功的文件组:"
+    $results.Values | Where-Object { -not ($_.TranscodeSuccess -and $_.ReviewSuccess -and $_.FixSuccess) -and $_.TranscodeSuccess } | ForEach-Object {
         $status = @()
-        if (-not $_.ReviewSuccess) { $status += "Review failed" }
-        if (-not $_.FixSuccess) { $status += "Fix failed" }
+        if (-not $_.ReviewSuccess) { $status += "审查失败" }
+        if (-not $_.FixSuccess) { $status += "修复失败" }
         Write-Host "  - $($_.GroupKey): $($status -join ', ')" -ForegroundColor Yellow
     }
 }
 
-Write-Host "`nOutput locations:"
-Write-Host "  WPF files: $WPF_DIR"
-Write-Host "  Fixed files: $SUPER_DIR"
+Write-Host "`n输出位置:"
+Write-Host "  WPF 文件: $($CONFIG.WpfDir)"
+Write-Host "  修复后的文件: $($CONFIG.WpfFixDir)"
 
 Write-Host ("=" * 60)
 
-exit $(if ($failed -gt 0) {1} else {0})
+exit $(if ($failed -gt 0) { 1 } else { 0 })

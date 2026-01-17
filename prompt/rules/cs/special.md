@@ -4,6 +4,7 @@
 
 ## 窗体关闭事件转换
 
+
 **规则内容**：
 
 1. `FrmBase_Closing` 方法参数从 `FormClosingEventArgs` 改为 `EventArgs`
@@ -38,6 +39,7 @@ protected override void FrmBase_Closing(object sender, EventArgs e)
 ---
 
 ## 方法参数转换
+
 
 **规则内容**：
 

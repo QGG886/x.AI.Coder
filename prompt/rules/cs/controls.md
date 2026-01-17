@@ -4,6 +4,7 @@
 
 ## CheckBox 属性转换
 
+
 **规则内容**：
 
 - `Checked` → `IsChecked`
@@ -28,6 +29,7 @@ if (this.chkPendQuote.IsChecked == true)
 
 ## Content 属性转换
 
+
 **规则内容**：
 
 - `Button.Text` → `Button.Content`
@@ -48,6 +50,7 @@ this.labelIRSDlgStatus.Content = string.Format("对话[{0}]", mktstatus);
 ---
 
 ## 账户选择逻辑合并
+
 
 **规则内容**：
 
